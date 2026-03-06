@@ -1,0 +1,8 @@
+nodeLinker: hoisted
+
+minimumReleaseAge: 1440
+minimumReleaseAgeExclude:
+  - expo
+  - expo-status-bar
+  - babel-preset-expo
+  - "@expo/cli"
