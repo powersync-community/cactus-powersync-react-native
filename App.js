@@ -19,15 +19,18 @@ import { useCactusLM, useCactusSTT } from 'cactus-react-native';
 import * as DocumentPicker from 'expo-document-picker';
 import { File as ExpoFile } from 'expo-file-system';
 
-import { AppEnv, missingRequiredEnvKeys } from './src/config/env';
+import { AppEnv } from './src/config/env';
+import { loadCredentials, saveCredentials, clearCredentials, loadModelPrefs, saveModelPrefs } from './src/config/credentials';
+import { LLM_MODELS, EMBEDDING_MODELS, STT_MODELS, DEFAULT_LLM_MODEL, DEFAULT_STT_MODEL } from './src/config/models';
 import { TABLES } from './src/powersync/schema';
 import { system } from './src/powersync/system';
 import { estimateCosts } from './src/utils/costModel';
-import { parseEmbedding, cosineSimilarity } from './src/utils/embeddings';
+import { parseEmbedding, cosineSimilarity, normalizeVector } from './src/utils/embeddings';
 import { readFileContent, chunkText } from './src/utils/fileParser';
 import { randomId } from './src/utils/randomId';
 
 const SCREENS = {
+  models: 'models',
   home: 'home',
   transcription: 'transcription',
   rag: 'rag',
@@ -49,35 +52,61 @@ export default function App() {
   const [initializing, setInitializing] = React.useState(true);
   const [initError, setInitError] = React.useState('');
   const [session, setSession] = React.useState(null);
+  const [credentialsReady, setCredentialsReady] = React.useState(false);
+  const [showSettings, setShowSettings] = React.useState(false);
+  const [skippedSettings, setSkippedSettings] = React.useState(false);
+
+  const bootstrap = React.useCallback(async (env) => {
+    try {
+      // If a specific env was provided (new credentials), reconfigure the system.
+      if (env) {
+        await system.reconfigure(env);
+      } else {
+        await system.init();
+      }
+
+      // Only fetch a session if credentials were configured.
+      const currentSession = system.hasCredentials
+        ? await system.connector.getSession()
+        : null;
+
+      setSession(currentSession);
+      setCredentialsReady(system.hasCredentials);
+    } catch (error) {
+      setInitError(error?.message ?? 'Failed to initialize the demo system.');
+    } finally {
+      setInitializing(false);
+    }
+  }, []);
 
   React.useEffect(() => {
     let active = true;
 
-    const bootstrap = async () => {
-      try {
-        await system.init();
-        const currentSession = await system.connector.getSession();
+    (async () => {
+      // Load runtime credentials saved by the user on a previous launch.
+      const saved = await loadCredentials();
+      if (!active) return;
 
-        if (active) {
-          setSession(currentSession);
-        }
-      } catch (error) {
-        if (active) {
-          setInitError(error?.message ?? 'Failed to initialize the demo system.');
-        }
-      } finally {
-        if (active) {
-          setInitializing(false);
-        }
+      if (saved?.supabaseUrl && saved?.supabaseAnonKey && saved?.powersyncUrl) {
+        // Merge saved credentials over any baked-in AppEnv values.
+        const mergedEnv = { ...AppEnv, ...saved };
+        system._applyEnv(mergedEnv);
       }
-    };
 
-    bootstrap();
+      await bootstrap(null);
+    })();
 
-    return () => {
-      active = false;
-    };
-  }, []);
+    return () => { active = false; };
+  }, [bootstrap]);
+
+  const handleCredentialsSaved = async (creds) => {
+    setInitializing(true);
+    setInitError('');
+    setShowSettings(false);
+    await saveCredentials(creds);
+    const mergedEnv = { ...AppEnv, ...creds };
+    await bootstrap(mergedEnv);
+  };
 
   if (initializing) {
     return (
@@ -85,7 +114,7 @@ export default function App() {
         <StatusBar style="dark" />
         <View style={styles.centeredScreen}>
           <ActivityIndicator size="large" />
-          <Text style={styles.subtitle}>Bootstrapping PowerSync, Supabase, and Cactus...</Text>
+          <Text style={styles.subtitle}>Starting up...</Text>
         </View>
       </SafeAreaView>
     );
@@ -98,7 +127,25 @@ export default function App() {
         <View style={styles.centeredScreen}>
           <Text style={styles.errorTitle}>Initialization error</Text>
           <Text style={styles.errorText}>{initError}</Text>
+          <Pressable style={[styles.secondaryButton, { marginTop: 16 }]} onPress={() => {
+            setInitError('');
+            setShowSettings(true);
+          }}>
+            <Text style={styles.secondaryButtonText}>Open Settings</Text>
+          </Pressable>
         </View>
+      </SafeAreaView>
+    );
+  }
+
+  if ((!credentialsReady && !skippedSettings) || showSettings) {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <StatusBar style="dark" />
+        <SettingsScreen
+          onSave={handleCredentialsSaved}
+          onSkip={() => { setSkippedSettings(true); setShowSettings(false); }}
+        />
       </SafeAreaView>
     );
   }
@@ -106,31 +153,23 @@ export default function App() {
   return (
     <SafeAreaView style={styles.safeArea}>
       <StatusBar style="dark" />
-      {missingRequiredEnvKeys.length > 0 ? (
-        <View style={styles.warningCard}>
-          <Text style={styles.warningTitle}>Missing env vars</Text>
-          <Text style={styles.warningText}>
-            Required values are missing: {missingRequiredEnvKeys.join(', ')}.
-          </Text>
-        </View>
-      ) : null}
-
-      {!session ? (
+      {!credentialsReady || session ? (
+        <PowerSyncContext.Provider value={system.powersync}>
+          <DemoShell
+            onLogout={credentialsReady ? async () => {
+              await system.connector.logout();
+              setSession(null);
+            } : null}
+            onOpenSettings={() => setShowSettings(true)}
+          />
+        </PowerSyncContext.Provider>
+      ) : (
         <AuthScreen
           onAuthenticated={setSession}
           cactusApiKey={AppEnv.cactusApiKey}
-          supabaseUrl={AppEnv.supabaseUrl}
-          powersyncUrl={AppEnv.powersyncUrl}
+          supabaseUrl={system.connector?.supabaseUrl ?? ''}
+          powersyncUrl={system.connector?.powersyncUrl ?? ''}
         />
-      ) : (
-        <PowerSyncContext.Provider value={system.powersync}>
-          <DemoShell
-            onLogout={async () => {
-              await system.connector.logout();
-              setSession(null);
-            }}
-          />
-        </PowerSyncContext.Provider>
       )}
     </SafeAreaView>
   );
@@ -230,8 +269,319 @@ function AuthScreen({ onAuthenticated, cactusApiKey, supabaseUrl, powersyncUrl }
   );
 }
 
-function DemoShell({ onLogout }) {
-  const [activeScreen, setActiveScreen] = React.useState(SCREENS.home);
+function SettingsScreen({ onSave, onSkip }) {
+  const [supabaseUrl, setSupabaseUrl] = React.useState(AppEnv.supabaseUrl ?? '');
+  const [supabaseAnonKey, setSupabaseAnonKey] = React.useState(AppEnv.supabaseAnonKey ?? '');
+  const [powersyncUrl, setPowersyncUrl] = React.useState(AppEnv.powersyncUrl ?? '');
+  const [cactusApiKey, setCactusApiKey] = React.useState(AppEnv.cactusApiKey ?? '');
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState('');
+
+  const save = React.useCallback(async () => {
+    if (!supabaseUrl.trim() || !supabaseAnonKey.trim() || !powersyncUrl.trim()) {
+      setError('Supabase URL, Anon Key, and PowerSync URL are required.');
+      return;
+    }
+    setBusy(true);
+    setError('');
+    try {
+      const creds = {
+        supabaseUrl: supabaseUrl.trim(),
+        supabaseAnonKey: supabaseAnonKey.trim(),
+        powersyncUrl: powersyncUrl.trim(),
+        cactusApiKey: cactusApiKey.trim() || undefined
+      };
+      await saveCredentials(creds);
+      await onSave(creds);
+    } catch (e) {
+      setError(e?.message ?? 'Failed to save credentials.');
+    } finally {
+      setBusy(false);
+    }
+  }, [supabaseUrl, supabaseAnonKey, powersyncUrl, cactusApiKey, onSave]);
+
+  const reset = React.useCallback(async () => {
+    await clearCredentials();
+    setSupabaseUrl('');
+    setSupabaseAnonKey('');
+    setPowersyncUrl('');
+    setCactusApiKey('');
+    setError('');
+  }, []);
+
+  return (
+    <ScrollView contentContainerStyle={styles.settingsContainer}>
+      <Text style={styles.settingsTitle}>Connection Settings</Text>
+      <Text style={styles.settingsSubtitle}>
+        Enter your Supabase and PowerSync credentials to enable sync.
+        RAG and Transcription work fully offline without credentials.
+      </Text>
+
+      <Text style={styles.settingsLabel}>Supabase URL</Text>
+      <TextInput
+        value={supabaseUrl}
+        onChangeText={setSupabaseUrl}
+        placeholder="https://xxxx.supabase.co"
+        autoCapitalize="none"
+        keyboardType="url"
+        style={styles.settingsInput}
+      />
+
+      <Text style={styles.settingsLabel}>Supabase Anon Key</Text>
+      <TextInput
+        value={supabaseAnonKey}
+        onChangeText={setSupabaseAnonKey}
+        placeholder="eyJ..."
+        autoCapitalize="none"
+        style={styles.settingsInput}
+      />
+
+      <Text style={styles.settingsLabel}>PowerSync URL</Text>
+      <TextInput
+        value={powersyncUrl}
+        onChangeText={setPowersyncUrl}
+        placeholder="https://xxxx.powersync.journeyapps.com"
+        autoCapitalize="none"
+        keyboardType="url"
+        style={styles.settingsInput}
+      />
+
+      <Text style={styles.settingsLabel}>Cactus API Key <Text style={styles.settingsLabelOptional}>(optional)</Text></Text>
+      <TextInput
+        value={cactusApiKey}
+        onChangeText={setCactusApiKey}
+        placeholder="sk-..."
+        autoCapitalize="none"
+        style={styles.settingsInput}
+      />
+
+      {error ? <Text style={styles.errorText}>{error}</Text> : null}
+
+      <Pressable style={[styles.primaryButton, { marginTop: 20 }]} onPress={save} disabled={busy}>
+        <Text style={styles.primaryButtonText}>{busy ? 'Connecting...' : 'Save & Connect'}</Text>
+      </Pressable>
+
+      <Pressable style={styles.secondaryButton} onPress={onSkip}>
+        <Text style={styles.secondaryButtonText}>Skip — use offline mode</Text>
+      </Pressable>
+
+      <Pressable style={[styles.secondaryButton, { marginTop: 0, borderColor: '#ccc' }]} onPress={reset}>
+        <Text style={[styles.secondaryButtonText, { color: '#999' }]}>Clear saved credentials</Text>
+      </Pressable>
+    </ScrollView>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Model card components — each must be its own component to call hooks
+// ---------------------------------------------------------------------------
+
+function ModelCardAction({ isDownloaded, isDownloading, isSelected, blocked, progress, onDownload, onSelect, slug }) {
+  if (isDownloaded) {
+    return (
+      <Pressable
+        style={[styles.modelActionButton, isSelected && styles.modelActionButtonSelected]}
+        onPress={() => onSelect(slug)}>
+        <Text style={[styles.modelActionButtonText, isSelected && styles.modelActionButtonTextSelected]}>
+          {isSelected ? '✓ Selected' : 'Select'}
+        </Text>
+      </Pressable>
+    );
+  }
+  if (isDownloading) {
+    return (
+      <View style={styles.modelProgressContainer}>
+        <View style={styles.modelProgressTrack}>
+          <View style={[styles.modelProgressBar, { width: `${progress}%` }]} />
+        </View>
+        <Text style={styles.modelProgressText}>{progress}%</Text>
+      </View>
+    );
+  }
+  return (
+    <Pressable
+      style={[styles.modelActionButton, blocked && styles.modelActionButtonBlocked]}
+      onPress={blocked ? null : onDownload}
+      disabled={blocked}>
+      <Text style={[styles.modelActionButtonText, blocked && styles.modelActionButtonTextBlocked]}>
+        Download
+      </Text>
+    </Pressable>
+  );
+}
+
+function LlmModelCard({ model, isSelected, onSelect, anyDownloading, onDownloadingChange }) {
+  const lm = useCactusLM({ model: model.slug });
+  const progress = Math.round((lm.downloadProgress ?? 0) * 100);
+
+  React.useEffect(() => {
+    onDownloadingChange(model.id, lm.isDownloading);
+  }, [lm.isDownloading, model.id, onDownloadingChange]);
+
+  return (
+    <View style={styles.modelCard}>
+      <View style={styles.modelCardHeader}>
+        <View style={{ flex: 1 }}>
+          <View style={styles.modelCardTitleRow}>
+            <Text style={styles.modelCardName}>{model.name}</Text>
+            {model.isRecommended ? (
+              <View style={styles.recommendedBadge}>
+                <Text style={styles.recommendedBadgeText}>Recommended</Text>
+              </View>
+            ) : null}
+            {model.badge ? (
+              <View style={[styles.recommendedBadge, { backgroundColor: '#f0fdf4' }]}>
+                <Text style={[styles.recommendedBadgeText, { color: '#15803d' }]}>{model.badge}</Text>
+              </View>
+            ) : null}
+          </View>
+          <Text style={styles.modelCardMeta}>
+            {model.sizeMb != null ? `${model.sizeMb >= 1000 ? (model.sizeMb / 1000).toFixed(1) + ' GB' : model.sizeMb + ' MB'}` : 'Size unknown'}
+          </Text>
+        </View>
+        <View style={{ marginLeft: 12 }}>
+          <ModelCardAction
+            isDownloaded={lm.isDownloaded}
+            isDownloading={lm.isDownloading}
+            isSelected={isSelected}
+            blocked={anyDownloading && !lm.isDownloading}
+            progress={progress}
+            onDownload={() => lm.download()}
+            onSelect={onSelect}
+            slug={model.slug}
+          />
+        </View>
+      </View>
+      <Text style={styles.modelCardDescription}>{model.description}</Text>
+    </View>
+  );
+}
+
+function SttModelCard({ model, isSelected, onSelect, anyDownloading, onDownloadingChange }) {
+  const stt = useCactusSTT({ model: model.slug });
+  const progress = Math.round((stt.downloadProgress ?? 0) * 100);
+
+  React.useEffect(() => {
+    onDownloadingChange(model.id, stt.isDownloading);
+  }, [stt.isDownloading, model.id, onDownloadingChange]);
+
+  return (
+    <View style={styles.modelCard}>
+      <View style={styles.modelCardHeader}>
+        <View style={{ flex: 1 }}>
+          <View style={styles.modelCardTitleRow}>
+            <Text style={styles.modelCardName}>{model.name}</Text>
+            {model.isRecommended ? (
+              <View style={styles.recommendedBadge}>
+                <Text style={styles.recommendedBadgeText}>Recommended</Text>
+              </View>
+            ) : null}
+          </View>
+          <Text style={styles.modelCardMeta}>
+            {model.sizeMb != null ? `${model.sizeMb >= 1000 ? (model.sizeMb / 1000).toFixed(1) + ' GB' : model.sizeMb + ' MB'}` : 'Size unknown'}
+          </Text>
+        </View>
+        <View style={{ marginLeft: 12 }}>
+          <ModelCardAction
+            isDownloaded={stt.isDownloaded}
+            isDownloading={stt.isDownloading}
+            isSelected={isSelected}
+            blocked={anyDownloading && !stt.isDownloading}
+            progress={progress}
+            onDownload={() => stt.download()}
+            onSelect={onSelect}
+            slug={model.slug}
+          />
+        </View>
+      </View>
+      <Text style={styles.modelCardDescription}>{model.description}</Text>
+    </View>
+  );
+}
+
+function ModelsScreen({ selectedLlmModel, selectedSttModel, onSelectLlm, onSelectStt }) {
+  const [activeTab, setActiveTab] = React.useState('llm');
+  // Track which model IDs are currently downloading (across all tabs)
+  const [downloadingIds, setDownloadingIds] = React.useState({});
+  const anyDownloading = Object.values(downloadingIds).some(Boolean);
+
+  const handleDownloadingChange = React.useCallback((id, isDownloading) => {
+    setDownloadingIds(prev => {
+      if (prev[id] === isDownloading) return prev;
+      return { ...prev, [id]: isDownloading };
+    });
+  }, []);
+
+  const TABS = [
+    { id: 'llm', label: 'LLM' },
+    { id: 'embedding', label: 'Embedding' },
+    { id: 'stt', label: 'Speech' }
+  ];
+  const NOTE = {
+    llm: 'LLM models power chat completions and RAG queries. Some also support embeddings.',
+    embedding: 'Dedicated embedding models for indexing RAG documents. Select one to use for the RAG screen.',
+    stt: 'Speech-to-text models power the voice transcription feature.'
+  };
+  return (
+    <View style={{ paddingBottom: 32 }}>
+      <View style={styles.modelTabRow}>
+        {TABS.map(tab => (
+          <Pressable
+            key={tab.id}
+            onPress={() => setActiveTab(tab.id)}
+            style={[styles.modelTabButton, activeTab === tab.id && styles.modelTabButtonActive]}>
+            <Text style={[styles.modelTabButtonText, activeTab === tab.id && styles.modelTabButtonTextActive]}>
+              {tab.label}
+            </Text>
+          </Pressable>
+        ))}
+      </View>
+      <Text style={styles.modelsSectionNote}>{NOTE[activeTab]}</Text>
+      {activeTab === 'llm' &&
+        LLM_MODELS.map(m => (
+          <LlmModelCard key={m.id} model={m} isSelected={selectedLlmModel === m.slug}
+            onSelect={onSelectLlm} anyDownloading={anyDownloading}
+            onDownloadingChange={handleDownloadingChange} />
+        ))}
+      {activeTab === 'embedding' &&
+        EMBEDDING_MODELS.map(m => (
+          <LlmModelCard key={m.id} model={m} isSelected={selectedLlmModel === m.slug}
+            onSelect={onSelectLlm} anyDownloading={anyDownloading}
+            onDownloadingChange={handleDownloadingChange} />
+        ))}
+      {activeTab === 'stt' &&
+        STT_MODELS.map(m => (
+          <SttModelCard key={m.id} model={m} isSelected={selectedSttModel === m.slug}
+            onSelect={onSelectStt} anyDownloading={anyDownloading}
+            onDownloadingChange={handleDownloadingChange} />
+        ))}
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------------------
+
+function DemoShell({ onLogout, onOpenSettings }) {
+  const [activeScreen, setActiveScreen] = React.useState(SCREENS.models);
+  const [selectedLlmModel, setSelectedLlmModel] = React.useState(DEFAULT_LLM_MODEL);
+  const [selectedSttModel, setSelectedSttModel] = React.useState(DEFAULT_STT_MODEL);
+
+  React.useEffect(() => {
+    loadModelPrefs().then(prefs => {
+      if (prefs?.llmModel) setSelectedLlmModel(prefs.llmModel);
+      if (prefs?.sttModel) setSelectedSttModel(prefs.sttModel);
+    });
+  }, []);
+
+  const handleSelectLlm = React.useCallback((slug) => {
+    setSelectedLlmModel(slug);
+    saveModelPrefs({ llmModel: slug, sttModel: selectedSttModel });
+  }, [selectedSttModel]);
+
+  const handleSelectStt = React.useCallback((slug) => {
+    setSelectedSttModel(slug);
+    saveModelPrefs({ llmModel: selectedLlmModel, sttModel: slug });
+  }, [selectedLlmModel]);
 
   const logCostEvent = React.useCallback(async (feature, metrics) => {
     const totalTokens = Number(metrics?.totalTokens ?? 0);
@@ -260,10 +610,18 @@ function DemoShell({ onLogout }) {
   }, []);
 
   const content = {
-    [SCREENS.home]: <HomeScreen setActiveScreen={setActiveScreen} />, 
-    [SCREENS.transcription]: <TranscriptionScreen logCostEvent={logCostEvent} />, 
-    [SCREENS.rag]: <RagScreen logCostEvent={logCostEvent} />, 
-    [SCREENS.attachments]: <AttachmentsScreen />, 
+    [SCREENS.models]: (
+      <ModelsScreen
+        selectedLlmModel={selectedLlmModel}
+        selectedSttModel={selectedSttModel}
+        onSelectLlm={handleSelectLlm}
+        onSelectStt={handleSelectStt}
+      />
+    ),
+    [SCREENS.home]: <HomeScreen lmModel={selectedLlmModel} setActiveScreen={setActiveScreen} />,
+    [SCREENS.transcription]: <TranscriptionScreen sttModel={selectedSttModel} logCostEvent={logCostEvent} />,
+    [SCREENS.rag]: <RagScreen lmModel={selectedLlmModel} logCostEvent={logCostEvent} />,
+    [SCREENS.attachments]: <AttachmentsScreen />,
     [SCREENS.offline]: <OfflineScreen />
   }[activeScreen];
 
@@ -271,6 +629,7 @@ function DemoShell({ onLogout }) {
     <View style={styles.shellContainer}>
       <View style={styles.navBar}>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.navButtonsRow}>
+          <NavButton label="Models" active={activeScreen === SCREENS.models} onPress={() => setActiveScreen(SCREENS.models)} />
           <NavButton label="Home" active={activeScreen === SCREENS.home} onPress={() => setActiveScreen(SCREENS.home)} />
           <NavButton
             label="Transcription"
@@ -290,9 +649,14 @@ function DemoShell({ onLogout }) {
           />
         </ScrollView>
 
-        <Pressable style={styles.logoutButton} onPress={onLogout}>
-          <Text style={styles.logoutButtonText}>Logout</Text>
+        <Pressable style={styles.logoutButton} onPress={onOpenSettings}>
+          <Text style={styles.logoutButtonText}>Settings</Text>
         </Pressable>
+        {onLogout ? (
+          <Pressable style={styles.logoutButton} onPress={onLogout}>
+            <Text style={styles.logoutButtonText}>Logout</Text>
+          </Pressable>
+        ) : null}
       </View>
 
       <ScrollView contentContainerStyle={styles.screenScroll}>{content}</ScrollView>
@@ -300,102 +664,143 @@ function DemoShell({ onLogout }) {
   );
 }
 
-function HomeScreen({ setActiveScreen }) {
+function HomeScreen({ lmModel, setActiveScreen }) {
   const status = useStatus();
-  const cactusLM = useCactusLM();
-  const [promptText, setPromptText] = React.useState('What is the capital of France?');
-  const { data: costRows = [] } = useQuery(
-    `SELECT
-      COUNT(*) AS runs,
-      COALESCE(SUM(cloud_cost_usd), 0) AS cloud_total,
-      COALESCE(SUM(device_cost_usd), 0) AS device_total,
-      COALESCE(SUM(saved_usd), 0) AS saved_total
-     FROM ${TABLES.costEvents}`
+  const cactusLM = useCactusLM({ model: lmModel });
+  const [sessionId, setSessionId] = React.useState(() => randomId());
+  const [input, setInput] = React.useState('');
+  const scrollRef = React.useRef(null);
+  const prevIsGenerating = React.useRef(false);
+  const pendingUserContent = React.useRef(null);
+
+  const { data: messages = [] } = useQuery(
+    `SELECT id, role, content, created_at
+     FROM ${TABLES.chatMessages}
+     WHERE session_id = ?
+     ORDER BY created_at ASC`,
+    [sessionId]
   );
 
-  const totals = costRows[0] ?? {
-    runs: 0,
-    cloud_total: 0,
-    device_total: 0,
-    saved_total: 0
+  const handleSend = async () => {
+    const text = input.trim();
+    if (!text || !cactusLM.isDownloaded || cactusLM.isGenerating) return;
+    setInput('');
+    pendingUserContent.current = text;
+
+    await system.powersync.execute(
+      `INSERT INTO ${TABLES.chatMessages} (id, created_at, session_id, role, content, model)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [randomId(), toIsoNow(), sessionId, 'user', text, lmModel]
+    );
+
+    // Build history from current messages + new user message
+    const history = messages.map(m => ({ role: m.role, content: m.content }));
+    cactusLM.complete({ messages: [...history, { role: 'user', content: text }] });
   };
 
+  // Save assistant message when generation finishes
   React.useEffect(() => {
-    if (!cactusLM.isDownloaded && !cactusLM.isDownloading) {
-      cactusLM.download();
+    if (prevIsGenerating.current && !cactusLM.isGenerating && cactusLM.completion && pendingUserContent.current !== null) {
+      system.powersync.execute(
+        `INSERT INTO ${TABLES.chatMessages} (id, created_at, session_id, role, content, model)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [randomId(), toIsoNow(), sessionId, 'assistant', cactusLM.completion, lmModel]
+      ).catch(console.error);
+      pendingUserContent.current = null;
     }
-  }, []);
+    prevIsGenerating.current = cactusLM.isGenerating;
+  }, [cactusLM.isGenerating, cactusLM.completion, sessionId, lmModel]);
 
-  const handleGenerate = () => {
-    if (!promptText.trim()) return;
-    cactusLM.complete({
-      messages: [{ role: 'user', content: promptText.trim() }],
-    });
+  // Auto-scroll to bottom when messages change or streaming
+  React.useEffect(() => {
+    scrollRef.current?.scrollToEnd({ animated: true });
+  }, [messages.length, cactusLM.completion]);
+
+  const startNewChat = () => {
+    setSessionId(randomId());
+    setInput('');
+    pendingUserContent.current = null;
   };
 
   return (
     <View style={styles.stack}>
       <View style={styles.card}>
         <Text style={styles.sectionTitle}>Overview</Text>
-        <Text style={styles.bodyText}>
-          This demo runs Cactus models on-device and stores app state in PowerSync for local-first UX.
-        </Text>
-        <Text style={styles.bodyText}>Connected: {status.connected ? 'yes' : 'no'}</Text>
-        <Text style={styles.bodyText}>Has synced: {String(status.hasSynced)}</Text>
-        <Text style={styles.bodyText}>Downloading: {String(status.dataFlowStatus.downloading ?? false)}</Text>
-        <Text style={styles.bodyText}>Uploading: {String(status.dataFlowStatus.uploading ?? false)}</Text>
+        <Text style={styles.bodyText}>Connected: {status.connected ? 'yes' : 'no'} · Synced: {String(status.hasSynced)}</Text>
       </View>
 
-      <View style={styles.card}>
-        <Text style={styles.sectionTitle}>Text Completion</Text>
-        <Text style={styles.bodyText}>
-          Type a prompt and generate a completion on-device using Cactus LM.
-        </Text>
-
-        {cactusLM.isDownloading ? (
-          <Text style={styles.bodyText}>
-            Downloading model: {Math.round(cactusLM.downloadProgress * 100)}%
-          </Text>
-        ) : !cactusLM.isDownloaded ? (
-          <Pressable style={styles.secondaryButton} onPress={() => cactusLM.download()}>
-            <Text style={styles.secondaryButtonText}>Download LM Model</Text>
+      <View style={[styles.card, { paddingBottom: 0 }]}>
+        <View style={styles.chatHeader}>
+          <Text style={styles.sectionTitle}>Chat</Text>
+          <Pressable onPress={startNewChat} style={styles.newChatButton}>
+            <Text style={styles.newChatButtonText}>New chat</Text>
           </Pressable>
-        ) : null}
+        </View>
 
-        <TextInput
-          value={promptText}
-          onChangeText={setPromptText}
-          multiline
-          style={[styles.input, styles.multilineInput]}
-          editable={!cactusLM.isGenerating}
-        />
-
-        <Pressable
-          style={styles.primaryButton}
-          onPress={handleGenerate}
-          disabled={!cactusLM.isDownloaded || cactusLM.isGenerating || !promptText.trim()}
-        >
-          <Text style={styles.primaryButtonText}>
-            {cactusLM.isGenerating ? 'Generating...' : 'Generate'}
-          </Text>
-        </Pressable>
-
-        {cactusLM.error ? <Text style={styles.errorText}>{cactusLM.error}</Text> : null}
-
-        {cactusLM.completion ? (
-          <View style={styles.resultCard}>
-            <Text style={styles.resultTitle}>Completion</Text>
-            <Text style={styles.bodyText}>{cactusLM.completion}</Text>
+        {!cactusLM.isDownloaded && !cactusLM.isDownloading ? (
+          <View style={styles.modelNotReadyBanner}>
+            <Text style={styles.modelNotReadyText}>
+              Model not downloaded. Go to the Models tab to download it.
+            </Text>
           </View>
         ) : null}
-      </View>
 
-      <View style={styles.card}>
-        <Text style={styles.sectionTitle}>Cost savings model</Text>
-        <Text style={styles.metricLine}>Inference runs: {Number(totals.runs ?? 0)}</Text>
-        <Text style={styles.metricLine}>Estimated cloud: ${Number(totals.cloud_total ?? 0).toFixed(4)}</Text>
-        <Text style={styles.metricLine}>Estimated on-device: ${Number(totals.device_total ?? 0).toFixed(4)}</Text>
-        <Text style={styles.metricLine}>Estimated saved: ${Number(totals.saved_total ?? 0).toFixed(4)}</Text>
+        <ScrollView
+          ref={scrollRef}
+          style={styles.chatMessages}
+          contentContainerStyle={{ paddingVertical: 8 }}
+          keyboardShouldPersistTaps="handled"
+        >
+          {messages.length === 0 && !cactusLM.isGenerating ? (
+            <Text style={styles.chatEmptyText}>Start a conversation below.</Text>
+          ) : null}
+          {messages.map(msg => (
+            <View
+              key={msg.id}
+              style={[
+                styles.chatBubble,
+                msg.role === 'user' ? styles.chatBubbleUser : styles.chatBubbleAssistant
+              ]}
+            >
+              <Text style={msg.role === 'user' ? styles.chatBubbleTextUser : styles.chatBubbleTextAssistant}>
+                {msg.content}
+              </Text>
+            </View>
+          ))}
+          {cactusLM.isGenerating && cactusLM.completion ? (
+            <View style={[styles.chatBubble, styles.chatBubbleAssistant]}>
+              <Text style={styles.chatBubbleTextAssistant}>{cactusLM.completion}</Text>
+            </View>
+          ) : null}
+          {cactusLM.isGenerating && !cactusLM.completion ? (
+            <View style={[styles.chatBubble, styles.chatBubbleAssistant]}>
+              <Text style={styles.chatBubbleTextAssistant}>...</Text>
+            </View>
+          ) : null}
+        </ScrollView>
+
+        {cactusLM.error ? <Text style={[styles.errorText, { marginHorizontal: 0 }]}>{cactusLM.error}</Text> : null}
+
+        <View style={styles.chatInputRow}>
+          <TextInput
+            value={input}
+            onChangeText={setInput}
+            placeholder="Message"
+            style={styles.chatInput}
+            editable={!cactusLM.isGenerating && cactusLM.isDownloaded}
+            multiline
+            maxLength={4000}
+            onSubmitEditing={handleSend}
+            blurOnSubmit={false}
+          />
+          <Pressable
+            style={[styles.chatSendButton, (!cactusLM.isDownloaded || cactusLM.isGenerating || !input.trim()) && styles.chatSendButtonDisabled]}
+            onPress={handleSend}
+            disabled={!cactusLM.isDownloaded || cactusLM.isGenerating || !input.trim()}
+          >
+            <Text style={styles.chatSendButtonText}>↑</Text>
+          </Pressable>
+        </View>
       </View>
 
       <View style={styles.card}>
@@ -427,8 +832,8 @@ const findWavDataOffset = (wavBytes) => {
   return -1;
 };
 
-function TranscriptionScreen({ logCostEvent }) {
-  const stt = useCactusSTT({ model: 'whisper-small' });
+function TranscriptionScreen({ sttModel, logCostEvent }) {
+  const stt = useCactusSTT({ model: sttModel });
   const { data: transcripts = [] } = useQuery(
     `SELECT id, created_at, audio_path, transcript, total_tokens, total_time_ms, cloud_handoff
      FROM ${TABLES.transcripts}
@@ -675,17 +1080,17 @@ function TranscriptionScreen({ logCostEvent }) {
           Tap Start to record and transcribe in real-time using Cactus streaming STT. The transcript syncs to Supabase via PowerSync every {DB_SYNC_INTERVAL_MS / 1000}s.
         </Text>
 
-        {!stt.isDownloaded ? (
-          <Pressable style={styles.secondaryButton} onPress={() => stt.download()} disabled={stt.isDownloading}>
-            <Text style={styles.secondaryButtonText}>
-              {stt.isDownloading
-                ? `Downloading model ${Math.round(stt.downloadProgress * 100)}%`
-                : 'Download STT Model'}
+        {!stt.isDownloaded && !stt.isDownloading ? (
+          <View style={styles.modelNotReadyBanner}>
+            <Text style={styles.modelNotReadyText}>
+              STT model not downloaded. Go to the Models tab to download it.
             </Text>
-          </Pressable>
-        ) : (
-          <Text style={styles.successText}>STT model downloaded.</Text>
-        )}
+          </View>
+        ) : stt.isDownloading ? (
+          <Text style={styles.bodyText}>
+            Downloading model: {Math.round((stt.downloadProgress ?? 0) * 100)}%
+          </Text>
+        ) : null}
 
         <View style={styles.recordingRow}>
           {!streaming ? (
@@ -753,8 +1158,8 @@ function TranscriptionScreen({ logCostEvent }) {
   );
 }
 
-function RagScreen({ logCostEvent }) {
-  const lm = useCactusLM({ model: 'qwen3-0.6b' });
+function RagScreen({ lmModel, logCostEvent }) {
+  const lm = useCactusLM({ model: lmModel });
   const { data: docs = [] } = useQuery(
     `SELECT id, created_at, title, content, embedding_json
      FROM ${TABLES.documents}
@@ -811,8 +1216,9 @@ function RagScreen({ logCostEvent }) {
         setFileStatus(`Embedding chunk ${i + 1}/${chunks.length}...`);
 
         const embedding = await lm.embed({ text: `${chunkTitle}\n${chunks[i]}` });
-        const embeddingJson = JSON.stringify(embedding?.embedding ?? embedding);
-        console.log('[RAG Import] embedding type:', typeof embedding?.embedding, 'json length:', embeddingJson?.length);
+        const rawVec = embedding?.embedding ?? embedding;
+        const embeddingJson = JSON.stringify(normalizeVector(rawVec));
+        console.log('[RAG Import] embedding type:', typeof rawVec, 'dimensions:', Array.isArray(rawVec) ? rawVec.length : 'n/a');
 
         await system.powersync.execute(
           `INSERT INTO ${TABLES.documents} (id, created_at, title, content, embedding_json)
@@ -846,10 +1252,11 @@ function RagScreen({ logCostEvent }) {
 
     try {
       const embedding = await lm.embed({ text: `${title.trim()}\n${content.trim()}` });
+      const rawVec = embedding?.embedding ?? embedding;
       await system.powersync.execute(
         `INSERT INTO ${TABLES.documents} (id, created_at, title, content, embedding_json)
          VALUES (?, ?, ?, ?, ?)`,
-        [randomId(), toIsoNow(), title.trim(), content.trim(), JSON.stringify(embedding.embedding)]
+        [randomId(), toIsoNow(), title.trim(), content.trim(), JSON.stringify(normalizeVector(rawVec))]
       );
       setTitle('');
       setContent('');
@@ -886,17 +1293,32 @@ function RagScreen({ logCostEvent }) {
       }
 
       const queryEmbedding = await lm.embed({ text: question.trim() });
+      const normQ = normalizeVector(queryEmbedding?.embedding ?? queryEmbedding);
       const ranked = localDocs
         .map((doc) => ({
           ...doc,
-          similarity: cosineSimilarity(queryEmbedding.embedding, parseEmbedding(doc.embedding_json) ?? [])
+          similarity: cosineSimilarity(normQ, parseEmbedding(doc.embedding_json) ?? [])
         }))
         .sort((a, b) => b.similarity - a.similarity)
         .slice(0, 3);
 
-      const context = ranked
-        .map((doc, idx) => `Doc ${idx + 1} (${doc.title})\n${doc.content}`)
-        .join('\n\n');
+      // Assemble context within a token budget (~1024 tokens = 4096 chars)
+      const TOKEN_BUDGET_CHARS = 1024 * 4;
+      let context = '';
+      for (const doc of ranked) {
+        const clean = doc.content
+          .replace(/<!--\s*Chunk\s+\d+\/\d+.*?-->\n?/g, '')
+          .trim();
+        if (!clean) continue;
+        const entry = `[${doc.title}]\n${clean}\n\n`;
+        if (context.length + entry.length > TOKEN_BUDGET_CHARS) {
+          const remaining = TOKEN_BUDGET_CHARS - context.length;
+          if (remaining > 200) context += entry.slice(0, remaining) + '...\n\n';
+          break;
+        }
+        context += entry;
+      }
+      context = context.trim();
 
       const completion = await lm.complete({
         messages: [
@@ -985,17 +1407,17 @@ function RagScreen({ logCostEvent }) {
           Documents are stored in PowerSync local SQLite and synced to Supabase. Retrieval runs fully on-device using Cactus embeddings.
         </Text>
 
-        {!lm.isDownloaded ? (
-          <Pressable style={styles.secondaryButton} onPress={() => lm.download()} disabled={lm.isDownloading}>
-            <Text style={styles.secondaryButtonText}>
-              {lm.isDownloading
-                ? `Downloading model ${Math.round(lm.downloadProgress * 100)}%`
-                : 'Download LLM Model'}
+        {!lm.isDownloaded && !lm.isDownloading ? (
+          <View style={styles.modelNotReadyBanner}>
+            <Text style={styles.modelNotReadyText}>
+              LLM model not downloaded. Go to the Models tab to download it.
             </Text>
-          </Pressable>
-        ) : (
-          <Text style={styles.successText}>LLM model downloaded.</Text>
-        )}
+          </View>
+        ) : lm.isDownloading ? (
+          <Text style={styles.bodyText}>
+            Downloading model: {Math.round((lm.downloadProgress ?? 0) * 100)}%
+          </Text>
+        ) : null}
 
         <Pressable
           style={styles.filePickerButton}
@@ -1716,5 +2138,266 @@ const styles = StyleSheet.create({
     color: '#94a3b8',
     fontSize: 12,
     fontWeight: '600'
+  },
+  settingsContainer: {
+    padding: 24,
+    paddingTop: 32
+  },
+  settingsTitle: {
+    fontSize: 24,
+    fontWeight: '700',
+    color: '#0f172a',
+    marginBottom: 10
+  },
+  settingsSubtitle: {
+    fontSize: 14,
+    color: '#64748b',
+    lineHeight: 20,
+    marginBottom: 24
+  },
+  settingsLabel: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#374151',
+    marginBottom: 6,
+    marginTop: 12
+  },
+  settingsLabelOptional: {
+    fontWeight: '400',
+    color: '#9ca3af'
+  },
+  settingsInput: {
+    borderWidth: 1,
+    borderColor: '#d1d5db',
+    borderRadius: 8,
+    padding: 12,
+    fontSize: 14,
+    color: '#0f172a',
+    backgroundColor: '#f9fafb'
+  },
+  // Model card styles
+  modelCard: {
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: '#e2e8f0'
+  },
+  modelCardHeader: {
+    flexDirection: 'row',
+    alignItems: 'flex-start'
+  },
+  modelCardTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    flexWrap: 'wrap',
+    marginBottom: 2
+  },
+  modelCardName: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#0f172a'
+  },
+  modelCardMeta: {
+    fontSize: 12,
+    color: '#64748b'
+  },
+  modelCardDescription: {
+    fontSize: 13,
+    color: '#475569',
+    lineHeight: 18,
+    marginTop: 10
+  },
+  recommendedBadge: {
+    backgroundColor: '#dbeafe',
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+    borderRadius: 99
+  },
+  recommendedBadgeText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#1d4ed8'
+  },
+  modelActionButton: {
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 8,
+    borderWidth: 1.5,
+    borderColor: '#3b82f6'
+  },
+  modelActionButtonSelected: {
+    backgroundColor: '#3b82f6'
+  },
+  modelActionButtonText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#3b82f6'
+  },
+  modelActionButtonTextSelected: {
+    color: '#fff'
+  },
+  modelActionButtonBlocked: {
+    borderColor: '#cbd5e1',
+    backgroundColor: '#f8fafc'
+  },
+  modelActionButtonTextBlocked: {
+    color: '#94a3b8'
+  },
+  modelProgressContainer: {
+    width: 72,
+    alignItems: 'center',
+    gap: 4
+  },
+  modelProgressTrack: {
+    width: '100%',
+    height: 4,
+    backgroundColor: '#e2e8f0',
+    borderRadius: 2,
+    overflow: 'hidden'
+  },
+  modelProgressBar: {
+    height: '100%',
+    backgroundColor: '#3b82f6',
+    borderRadius: 2
+  },
+  modelProgressText: {
+    fontSize: 11,
+    color: '#64748b'
+  },
+  modelNotReadyBanner: {
+    backgroundColor: '#fef3c7',
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 12
+  },
+  modelNotReadyText: {
+    color: '#92400e',
+    fontSize: 13,
+    lineHeight: 18
+  },
+  chatHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8
+  },
+  newChatButton: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 8,
+    backgroundColor: '#f1f5f9'
+  },
+  newChatButtonText: {
+    fontSize: 13,
+    color: '#475569',
+    fontWeight: '500'
+  },
+  chatMessages: {
+    height: 300,
+    marginHorizontal: -16,
+    paddingHorizontal: 16
+  },
+  chatEmptyText: {
+    textAlign: 'center',
+    color: '#94a3b8',
+    fontSize: 13,
+    marginTop: 60
+  },
+  chatBubble: {
+    maxWidth: '80%',
+    borderRadius: 16,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    marginBottom: 8
+  },
+  chatBubbleUser: {
+    alignSelf: 'flex-end',
+    backgroundColor: '#6366f1'
+  },
+  chatBubbleAssistant: {
+    alignSelf: 'flex-start',
+    backgroundColor: '#f1f5f9'
+  },
+  chatBubbleTextUser: {
+    color: '#fff',
+    fontSize: 14,
+    lineHeight: 20
+  },
+  chatBubbleTextAssistant: {
+    color: '#1e293b',
+    fontSize: 14,
+    lineHeight: 20
+  },
+  chatInputRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    borderTopWidth: 1,
+    borderTopColor: '#e2e8f0',
+    marginHorizontal: -16,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    gap: 8
+  },
+  chatInput: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+    borderRadius: 20,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    fontSize: 14,
+    maxHeight: 120,
+    backgroundColor: '#f8fafc'
+  },
+  chatSendButton: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: '#6366f1',
+    alignItems: 'center',
+    justifyContent: 'center'
+  },
+  chatSendButtonDisabled: {
+    backgroundColor: '#cbd5e1'
+  },
+  chatSendButtonText: {
+    color: '#fff',
+    fontSize: 18,
+    fontWeight: '600'
+  },
+  modelsSectionNote: {
+    fontSize: 13,
+    color: '#64748b',
+    lineHeight: 18,
+    marginBottom: 16
+  },
+  modelTabRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 16,
+    paddingTop: 4
+  },
+  modelTabButton: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+    backgroundColor: '#f8fafc'
+  },
+  modelTabButtonActive: {
+    backgroundColor: '#3b82f6',
+    borderColor: '#3b82f6'
+  },
+  modelTabButtonText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#64748b'
+  },
+  modelTabButtonTextActive: {
+    color: '#fff'
   }
 });

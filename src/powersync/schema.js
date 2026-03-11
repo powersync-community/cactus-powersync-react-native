@@ -8,6 +8,7 @@ import {
 } from '@powersync/common';
 
 export const TABLES = {
+  chatMessages: 'demo_chat_messages',
   documents: 'demo_documents',
   queries: 'demo_queries',
   transcripts: 'demo_transcripts',
@@ -17,6 +18,24 @@ export const TABLES = {
 };
 
 export const AppSchema = new Schema([
+  new Table({
+    name: TABLES.chatMessages,
+    columns: [
+      new Column({ name: 'created_at', type: ColumnType.TEXT }),
+      new Column({ name: 'session_id', type: ColumnType.TEXT }),
+      new Column({ name: 'role', type: ColumnType.TEXT }),
+      new Column({ name: 'content', type: ColumnType.TEXT }),
+      new Column({ name: 'model', type: ColumnType.TEXT }),
+      new Column({ name: 'total_tokens', type: ColumnType.INTEGER }),
+      new Column({ name: 'total_time_ms', type: ColumnType.INTEGER })
+    ],
+    indexes: [
+      new Index({
+        name: 'chat_messages_session',
+        columns: [new IndexedColumn({ name: 'session_id' }), new IndexedColumn({ name: 'created_at' })]
+      })
+    ]
+  }),
   new Table({
     name: TABLES.documents,
     columns: [
