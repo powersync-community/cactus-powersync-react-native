@@ -38,6 +38,7 @@ const fileSystemStorage = {
 };
 
 export const createSupabaseClient = (env = AppEnv) => {
+  if (!env.supabaseUrl || !env.supabaseAnonKey) return null;
   return createClient(env.supabaseUrl, env.supabaseAnonKey, {
     auth: {
       storage: fileSystemStorage,

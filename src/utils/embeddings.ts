@@ -1,4 +1,16 @@
-export const cosineSimilarity = (a = [], b = []) => {
+/**
+ * L2-normalize a vector so that cosine similarity reduces to a dot product.
+ * Pre-normalizing before storage makes retrieval numerically stable.
+ */
+export const normalizeVector = (vector: number[]): number[] => {
+  if (!Array.isArray(vector) || vector.length === 0) return vector;
+  let norm = 0;
+  for (let i = 0; i < vector.length; i++) norm += vector[i] * vector[i];
+  norm = Math.sqrt(norm) || 1;
+  return vector.map((v) => v / norm);
+};
+
+export const cosineSimilarity = (a: number[] = [], b: number[] = []): number => {
   if (!Array.isArray(a) || !Array.isArray(b) || a.length === 0 || b.length === 0) {
     return 0;
   }
@@ -23,7 +35,7 @@ export const cosineSimilarity = (a = [], b = []) => {
   return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 };
 
-export const parseEmbedding = (raw) => {
+export const parseEmbedding = (raw: string | null | undefined): number[] | null => {
   if (!raw) {
     return null;
   }
